@@ -1,342 +1,385 @@
+# -*- coding: utf-8 -*-
+"""LogiSense | Resumen operativo y recomendaciones de transporte."""
+from __future__ import annotations
+
+import io
+import math
 import re
 import unicodedata
-from io import BytesIO
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 
-st.set_page_config(page_title="Optimización de fletes", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="LogiSense | Optimización de fletes", page_icon="🚚", layout="wide")
 
-MONTH_SHEETS = {
+MESES = [
     "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
     "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE",
+]
+CAPACIDADES = {
+    "TRAILER": {"tarimas": 30, "kgs": 24000},
+    "TORTON": {"tarimas": 12, "kgs": 12000},
+    "RABON": {"tarimas": 8, "kgs": 8000},
+    "CAMIONETA 3.5": {"tarimas": 4, "kgs": 3500},
+    "CAMIONETA 1.5": {"tarimas": 2, "kgs": 1500},
 }
-MONTH_ORDER = list(MONTH_SHEETS)
-VEHICLE_ORDER = ["CAMIONETA 1.5", "CAMIONETA 3.5", "RABON", "TORTON", "TRAILER"]
-CAPACITIES = {
-    "CAMIONETA 1.5": {"tarimas": 2, "kg": 1500},
-    "CAMIONETA 3.5": {"tarimas": 4, "kg": 3500},
-    "RABON": {"tarimas": 8, "kg": 8000},
-    "TORTON": {"tarimas": 12, "kg": 12000},
-    "TRAILER": {"tarimas": 30, "kg": 24000},
-}
+TIPOS_UNIDAD = list(CAPACIDADES)
+COLUMNAS_REQUERIDAS = [
+    "CLIENTE", "LOCALIDAD", "IMPORTE FACTURADO SIN IVA",
+    "TARIMAS TOTALES POR VIAJE", "FLETE FACTURA", "INDICE VIAJES",
+    "TIPO DE TRANSPORTE", "MES FACTURA", "KG MOVIDOS",
+]
 
 
-def normalize_text(value):
-    """Normaliza mayúsculas, acentos, espacios y caracteres para hacer coincidencias robustas."""
-    if pd.isna(value):
+def normalizar_texto(valor: object) -> str:
+    """Normaliza para comparar sin sensibilidad a acentos, espacios o mayúsculas."""
+    if pd.isna(valor):
         return ""
-    value = str(value).strip().upper()
-    value = unicodedata.normalize("NFD", value)
-    value = "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
-    value = re.sub(r"\s+", " ", value)
-    return value
+    texto = unicodedata.normalize("NFKD", str(valor))
+    texto = "".join(char for char in texto if not unicodedata.combining(char))
+    texto = re.sub(r"\s+", " ", texto.strip().upper())
+    return texto
 
 
-def normalize_unit(value):
-    value = normalize_text(value)
-    aliases = {
-        "CAMIONETA 1.5 TON": "CAMIONETA 1.5",
-        "CAMIONETA 1.5T": "CAMIONETA 1.5",
-        "CAMIONETA 3.5 TON": "CAMIONETA 3.5",
-        "CAMIONETA 3.5T": "CAMIONETA 3.5",
-        "CAMION 3.5": "CAMIONETA 3.5",
-        "RABÓN": "RABON",
-        "TRÁILER": "TRAILER",
-        "TRAILER 53": "TRAILER",
+def normalizar_columna(nombre: object) -> str:
+    return normalizar_texto(nombre).replace(".", "").replace("_", " ")
+
+
+def numero_limpio(serie: pd.Series) -> pd.Series:
+    texto = serie.astype(str).str.strip()
+    texto = texto.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    texto = texto.str.replace(r"[$,%\s]", "", regex=True)
+    # Si hay coma y punto, se asume que la coma es separador de miles.
+    ambos = texto.str.contains(",", na=False) & texto.str.contains(r"\.", na=False)
+    texto.loc[ambos] = texto.loc[ambos].str.replace(",", "", regex=False)
+    # Si solo hay coma, se considera decimal.
+    solo_coma = texto.str.contains(",", na=False) & ~texto.str.contains(r"\.", na=False)
+    texto.loc[solo_coma] = texto.loc[solo_coma].str.replace(",", ".", regex=False)
+    return pd.to_numeric(texto, errors="coerce").fillna(0)
+
+
+def estandarizar_unidad(valor: object) -> str:
+    texto = normalizar_texto(valor)
+    equivalencias = {
+        "CAMIONETA 1.5": "CAMIONETA 1.5", "CAMIONETA 15": "CAMIONETA 1.5",
+        "1.5 TON": "CAMIONETA 1.5", "1.5T": "CAMIONETA 1.5",
+        "CAMIONETA 3.5": "CAMIONETA 3.5", "CAMIONETA 35": "CAMIONETA 3.5",
+        "3.5 TON": "CAMIONETA 3.5", "3.5T": "CAMIONETA 3.5",
+        "RABON": "RABON", "RABÓN": "RABON",
+        "TORTON": "TORTON", "TORTÓN": "TORTON",
+        "TRAILER": "TRAILER", "TRÁILER": "TRAILER", "TRACTOCAMION": "TRAILER",
     }
-    return aliases.get(value, value)
+    return equivalencias.get(texto, texto)
 
 
-def money_to_number(series):
-    cleaned = (
-        series.astype(str)
-        .str.replace(r"[$,\s]", "", regex=True)
-        .str.replace("(", "-", regex=False)
-        .str.replace(")", "", regex=False)
-    )
-    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
+def mes_estandar(valor: object) -> str:
+    texto = normalizar_texto(valor)
+    return texto if texto in MESES else texto
 
 
-def find_column(frame, wanted_name):
-    target = normalize_text(wanted_name)
-    matches = [col for col in frame.columns if normalize_text(col) == target]
-    return matches[0] if matches else None
+def encontrar_columna(columnas: pd.Index, objetivo: str) -> str | None:
+    objetivo_norm = normalizar_columna(objetivo)
+    for columna in columnas:
+        if normalizar_columna(columna) == objetivo_norm:
+            return columna
+    return None
 
 
-def load_monthly_operations(file_bytes):
-    excel = pd.ExcelFile(BytesIO(file_bytes))
-    usable_sheets = [sheet for sheet in excel.sheet_names if normalize_text(sheet) in MONTH_SHEETS]
-    if not usable_sheets:
-        raise ValueError("No se encontraron hojas con nombres de meses como ENERO, FEBRERO o MARZO.")
+@st.cache_data(show_spinner=False)
+def cargar_operacion(archivo_bytes: bytes) -> tuple[pd.DataFrame, list[str], list[str]]:
+    libro = pd.ExcelFile(io.BytesIO(archivo_bytes))
+    hojas_validas = [hoja for hoja in libro.sheet_names if normalizar_texto(hoja) in MESES]
+    partes, errores = [], []
 
-    required = [
-        "CLIENTE", "LOCALIDAD", "IMPORTE FACTURADO SIN IVA",
-        "TARIMAS TOTALES POR VIAJE", "FLETE FACTURA", "INDICE VIAJES",
-        "TIPO DE TRANSPORTE", "MES FACTURA", "KG MOVIDOS",
-    ]
-    monthly_frames = []
-    errors = []
-    for sheet in usable_sheets:
-        frame = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet)
-        rename_map = {}
-        missing = []
-        for column_name in required:
-            actual = find_column(frame, column_name)
-            if actual is None:
-                missing.append(column_name)
-            else:
-                rename_map[actual] = column_name
-        if missing:
-            errors.append(f"{sheet}: faltan {', '.join(missing)}")
+    for hoja in hojas_validas:
+        temporal = pd.read_excel(libro, sheet_name=hoja)
+        temporal.columns = [str(col).strip() for col in temporal.columns]
+        faltantes = [col for col in COLUMNAS_REQUERIDAS if encontrar_columna(temporal.columns, col) is None]
+        if faltantes:
+            errores.append(f"{hoja}: faltan {', '.join(faltantes)}")
             continue
-        frame = frame.rename(columns=rename_map)[required].copy()
-        frame["HOJA_ORIGEN"] = sheet
-        monthly_frames.append(frame)
+        renombres = {
+            encontrar_columna(temporal.columns, campo): campo
+            for campo in COLUMNAS_REQUERIDAS
+        }
+        temporal = temporal.rename(columns=renombres)
+        temporal["MES_ORIGEN_HOJA"] = normalizar_texto(hoja)
+        partes.append(temporal)
 
-    if not monthly_frames:
-        raise ValueError("Ninguna hoja mensual contiene todas las columnas requeridas. " + " | ".join(errors))
+    if not partes:
+        return pd.DataFrame(), hojas_validas, errores
 
-    data = pd.concat(monthly_frames, ignore_index=True)
-    for col in ["IMPORTE FACTURADO SIN IVA", "TARIMAS TOTALES POR VIAJE", "FLETE FACTURA", "KG MOVIDOS"]:
-        data[col] = money_to_number(data[col])
-    data["CLIENTE"] = data["CLIENTE"].fillna("").astype(str).str.strip()
-    data["Destino"] = data["LOCALIDAD"].fillna("").astype(str).str.strip()
-    data["DESTINO_MATCH"] = data["Destino"].map(normalize_text)
-    data["TIPO DE TRANSPORTE"] = data["TIPO DE TRANSPORTE"].map(normalize_unit)
-    data["MES FACTURA"] = data["MES FACTURA"].fillna(data["HOJA_ORIGEN"]).map(normalize_text)
-    data["MES FACTURA"] = data["MES FACTURA"].replace("", np.nan).fillna(data["HOJA_ORIGEN"].map(normalize_text))
-    data["INDICE VIAJES"] = data["INDICE VIAJES"].fillna("").astype(str).str.strip()
-    # Sin índice se conserva cada registro como viaje independiente.
-    blank_indices = data["INDICE VIAJES"].eq("")
-    data.loc[blank_indices, "INDICE VIAJES"] = "SIN_INDICE_" + data.index[blank_indices].astype(str)
-    return data, usable_sheets, errors
-
-
-def load_rates(file_bytes):
-    raw = pd.read_excel(BytesIO(file_bytes), header=None)
-    if raw.shape[1] < 4:
-        raise ValueError("El archivo de tarifas debe tener al menos cuatro columnas: TRANSPORTISTA, UNIDAD, COSTO DE FLETE y DESTINO.")
-
-    rates = raw.iloc[:, :4].copy()
-    rates.columns = ["TRANSPORTISTA", "UNIDAD", "COSTO DE FLETE", "DESTINO"]
-    # Elimina una posible fila de encabezados y registros vacíos.
-    rates = rates[rates["UNIDAD"].map(normalize_text) != "UNIDAD"].copy()
-    rates["UNIDAD"] = rates["UNIDAD"].map(normalize_unit)
-    rates["DESTINO"] = rates["DESTINO"].fillna("").astype(str).str.strip()
-    rates["DESTINO_MATCH"] = rates["DESTINO"].map(normalize_text)
-    rates["COSTO DE FLETE"] = money_to_number(rates["COSTO DE FLETE"])
-    rates = rates[
-        rates["UNIDAD"].isin(VEHICLE_ORDER)
-        & rates["DESTINO_MATCH"].ne("")
-        & rates["COSTO DE FLETE"].gt(0)
-    ]
-    return rates
+    datos = pd.concat(partes, ignore_index=True)
+    for columna in ["IMPORTE FACTURADO SIN IVA", "TARIMAS TOTALES POR VIAJE", "FLETE FACTURA", "KG MOVIDOS"]:
+        datos[columna] = numero_limpio(datos[columna])
+    datos["CLIENTE"] = datos["CLIENTE"].fillna("").astype(str).str.strip()
+    datos["Destino"] = datos["LOCALIDAD"].fillna("").astype(str).str.strip()
+    datos["DESTINO_MATCH"] = datos["Destino"].map(normalizar_texto)
+    datos["TIPO_UNIDAD"] = datos["TIPO DE TRANSPORTE"].map(estandarizar_unidad)
+    datos["MES"] = datos["MES FACTURA"].map(mes_estandar)
+    datos.loc[~datos["MES"].isin(MESES), "MES"] = datos["MES_ORIGEN_HOJA"]
+    datos["INDICE_LIMPIO"] = datos["INDICE VIAJES"].fillna("").astype(str).str.strip()
+    datos["ID_VIAJE"] = np.where(
+        datos["INDICE_LIMPIO"].isin(["", "nan", "None"]),
+        "FILA_" + datos.index.astype(str),
+        datos["INDICE_LIMPIO"],
+    )
+    return datos, hojas_validas, errores
 
 
-def summarize_operations(data):
-    key_columns = ["CLIENTE", "Destino", "MES FACTURA"]
-    # Un viaje es único por cliente/destino/mes/índice, aunque existan varias filas asociadas.
-    trip_level = (
-        data.groupby(key_columns + ["INDICE VIAJES"], dropna=False, as_index=False)
+@st.cache_data(show_spinner=False)
+def cargar_tarifas(archivo_bytes: bytes) -> tuple[pd.DataFrame, str | None]:
+    try:
+        libro = pd.ExcelFile(io.BytesIO(archivo_bytes))
+        tarifa = pd.read_excel(libro, sheet_name=libro.sheet_names[0])
+    except Exception as exc:
+        return pd.DataFrame(), f"No se pudo leer el archivo de tarifas: {exc}"
+
+    tarifa.columns = [str(col).strip() for col in tarifa.columns]
+    requeridas = ["TRANSPORTISTA", "UNIDAD", "COSTO DE FLETE", "DESTINO"]
+    mapeo = {encontrar_columna(tarifa.columns, campo): campo for campo in requeridas}
+    if any(col is None for col in mapeo):
+        # Alternativa solicitada: columnas A-D aunque no tengan encabezados correctos.
+        if tarifa.shape[1] < 4:
+            return pd.DataFrame(), "El tarifario requiere al menos cuatro columnas."
+        tarifa = tarifa.iloc[:, :4].copy()
+        tarifa.columns = requeridas
+    else:
+        tarifa = tarifa.rename(columns=mapeo)
+
+    tarifa = tarifa[requeridas].copy()
+    tarifa["TRANSPORTISTA"] = tarifa["TRANSPORTISTA"].fillna("").astype(str).str.strip()
+    tarifa["UNIDAD"] = tarifa["UNIDAD"].map(estandarizar_unidad)
+    tarifa["DESTINO_MATCH"] = tarifa["DESTINO"].map(normalizar_texto)
+    tarifa["COSTO DE FLETE"] = numero_limpio(tarifa["COSTO DE FLETE"])
+    tarifa = tarifa[
+        tarifa["UNIDAD"].isin(TIPOS_UNIDAD)
+        & tarifa["DESTINO_MATCH"].ne("")
+        & tarifa["COSTO DE FLETE"].gt(0)
+    ].copy()
+    if tarifa.empty:
+        return tarifa, "No se encontraron tarifas válidas para las unidades configuradas."
+    return tarifa, None
+
+
+def resumir(datos: pd.DataFrame) -> pd.DataFrame:
+    claves = ["CLIENTE", "Destino", "DESTINO_MATCH", "MES"]
+    agregados = (
+        datos.groupby(claves, dropna=False)
         .agg(
             **{
-                "Importe facturado viaje": ("IMPORTE FACTURADO SIN IVA", "sum"),
-                "Tarimas viaje": ("TARIMAS TOTALES POR VIAJE", "sum"),
-                "Flete viaje": ("FLETE FACTURA", "sum"),
-                "KG viaje": ("KG MOVIDOS", "sum"),
+                "Cantidad de viajes": ("ID_VIAJE", "nunique"),
+                "Suma facturado": ("IMPORTE FACTURADO SIN IVA", "sum"),
+                "Suma tarimas": ("TARIMAS TOTALES POR VIAJE", "sum"),
+                "Suma flete": ("FLETE FACTURA", "sum"),
+                "KG movidos": ("KG MOVIDOS", "sum"),
             }
         )
-    )
-    base = (
-        trip_level.groupby(key_columns, as_index=False)
-        .agg(
-            **{
-                "Cantidad de viajes": ("INDICE VIAJES", "nunique"),
-                "Suma facturado": ("Importe facturado viaje", "sum"),
-                "Suma tarimas": ("Tarimas viaje", "sum"),
-                "Suma flete": ("Flete viaje", "sum"),
-                "KG movidos": ("KG viaje", "sum"),
-            }
-        )
-    )
-    base["Tarimas promedio"] = base["Suma tarimas"] / base["Cantidad de viajes"].replace(0, np.nan)
-    base["Promedio flete"] = base["Suma flete"] / base["Cantidad de viajes"].replace(0, np.nan)
-    base["Flete/Tarimas"] = base["Suma flete"] / base["Suma tarimas"].replace(0, np.nan)
-
-    transport_counts = (
-        data[data["TIPO DE TRANSPORTE"].isin(VEHICLE_ORDER)]
-        .groupby(key_columns + ["TIPO DE TRANSPORTE"])
-        .size()
-        .unstack(fill_value=0)
-        .reindex(columns=VEHICLE_ORDER, fill_value=0)
         .reset_index()
     )
-    result = base.merge(transport_counts, on=key_columns, how="left")
-    for unit in VEHICLE_ORDER:
-        result[unit] = result[unit].fillna(0).astype(int)
-    return result
-
-
-def recommendation_for_group(group_row, rates):
-    destination_key = group_row["Destino_match"]
-    destination_rates = rates[rates["DESTINO_MATCH"] == destination_key].copy()
-    if destination_rates.empty:
-        return "Sin tarifa coincidente para este destino. Revise el nombre del destino en el tarifario.", ""
-
-    total_tarimas = float(group_row["Suma tarimas"])
-    total_kg = float(group_row["KG movidos"])
-    current_cost = float(group_row["Suma flete"])
-    candidates = []
-    for unit in VEHICLE_ORDER:
-        unit_rates = destination_rates[destination_rates["UNIDAD"] == unit]
-        if unit_rates.empty:
-            continue
-        capacity = CAPACITIES[unit]
-        units_needed = max(
-            int(np.ceil(total_tarimas / capacity["tarimas"])) if total_tarimas > 0 else 1,
-            int(np.ceil(total_kg / capacity["kg"])) if total_kg > 0 else 1,
-        )
-        best_rate = unit_rates.loc[unit_rates["COSTO DE FLETE"].idxmin()]
-        estimated_cost = units_needed * best_rate["COSTO DE FLETE"]
-        candidates.append(
-            {
-                "Unidad": unit,
-                "Unidades requeridas": units_needed,
-                "Costo estimado": estimated_cost,
-                "Transportista": best_rate["TRANSPORTISTA"],
-            }
-        )
-    if not candidates:
-        return "No hay unidades válidas con tarifa para este destino.", ""
-
-    candidate_df = pd.DataFrame(candidates).sort_values(["Costo estimado", "Unidades requeridas"])
-    first = candidate_df.iloc[0]
-    text = (
-        f"Recomendación principal: {int(first['Unidades requeridas'])} {first['Unidad']} "
-        f"con {first['Transportista']} — costo estimado ${first['Costo estimado']:,.2f}."
+    conteos = (
+        datos.assign(TIPO_UNIDAD=datos["TIPO_UNIDAD"].where(datos["TIPO_UNIDAD"].isin(TIPOS_UNIDAD)))
+        .pivot_table(index=claves, columns="TIPO_UNIDAD", values="ID_VIAJE", aggfunc="size", fill_value=0)
+        .reindex(columns=TIPOS_UNIDAD, fill_value=0)
+        .reset_index()
     )
-    savings = current_cost - first["Costo estimado"]
-    if current_cost > 0:
-        text += f" Frente al flete facturado (${current_cost:,.2f}), la variación estimada es ${savings:,.2f}."
-    if len(candidate_df) > 1:
-        second = candidate_df.iloc[1]
-        text += (
-            f" Alternativa: {int(second['Unidades requeridas'])} {second['Unidad']} "
-            f"con {second['Transportista']} — ${second['Costo estimado']:,.2f}."
-        )
-    return text, candidate_df
+    resultado = agregados.merge(conteos, on=claves, how="left")
+    resultado["Tarimas promedio"] = np.where(
+        resultado["Cantidad de viajes"].gt(0),
+        resultado["Suma tarimas"] / resultado["Cantidad de viajes"], 0,
+    )
+    resultado["Promedio flete"] = np.where(
+        resultado["Cantidad de viajes"].gt(0),
+        resultado["Suma flete"] / resultado["Cantidad de viajes"], 0,
+    )
+    resultado["Flete/Tarimas"] = np.where(
+        resultado["Suma tarimas"].gt(0),
+        resultado["Suma flete"] / resultado["Suma tarimas"], 0,
+    )
+    return resultado.sort_values(["CLIENTE", "Destino", "MES"]).reset_index(drop=True)
 
 
-def currency_columns(frame):
-    money_columns = ["Suma facturado", "Suma flete", "Promedio flete", "Flete/Tarimas"]
-    formatted = frame.copy()
-    for col in money_columns:
-        if col in formatted:
-            formatted[col] = formatted[col].map(lambda val: f"${val:,.2f}" if pd.notna(val) else "-")
-    for col in ["Suma tarimas", "Tarimas promedio", "KG movidos"]:
-        if col in formatted:
-            formatted[col] = formatted[col].map(lambda val: f"{val:,.2f}" if pd.notna(val) else "-")
-    return formatted
+def recomendaciones(resumen: pd.DataFrame, tarifas: pd.DataFrame) -> pd.DataFrame:
+    salida = []
+    for _, fila in resumen.iterrows():
+        disponibles = tarifas[tarifas["DESTINO_MATCH"].eq(fila["DESTINO_MATCH"])].copy()
+        opciones = []
+        for unidad, capacidad in CAPACIDADES.items():
+            candidatos = disponibles[disponibles["UNIDAD"].eq(unidad)]
+            if candidatos.empty:
+                continue
+            unidades_necesarias = max(
+                math.ceil(fila["Suma tarimas"] / capacidad["tarimas"]) if fila["Suma tarimas"] > 0 else 1,
+                math.ceil(fila["KG movidos"] / capacidad["kgs"]) if fila["KG movidos"] > 0 else 1,
+            )
+            mejor = candidatos.loc[candidatos["COSTO DE FLETE"].idxmin()]
+            opciones.append({
+                "unidad": unidad,
+                "unidades": unidades_necesarias,
+                "costo_total": unidades_necesarias * mejor["COSTO DE FLETE"],
+                "transportista": mejor["TRANSPORTISTA"],
+            })
+        opciones.sort(key=lambda opcion: opcion["costo_total"])
+        base = fila.to_dict()
+        if opciones:
+            primera = opciones[0]
+            base["Recomendación principal"] = (
+                f'{primera["unidades"]} {primera["unidad"]} con {primera["transportista"]} '
+                f'— costo estimado ${primera["costo_total"]:,.2f}'
+            )
+            if len(opciones) > 1:
+                segunda = opciones[1]
+                base["Alternativa si el CEDIS no acepta la primera"] = (
+                    f'{segunda["unidades"]} {segunda["unidad"]} con {segunda["transportista"]} '
+                    f'— costo estimado ${segunda["costo_total"]:,.2f}'
+                )
+            else:
+                base["Alternativa si el CEDIS no acepta la primera"] = "No hay una segunda unidad tarifada para este destino."
+        else:
+            base["Recomendación principal"] = "Sin tarifa compatible para este destino."
+            base["Alternativa si el CEDIS no acepta la primera"] = "Carga tarifas para este destino."
+        salida.append(base)
+    return pd.DataFrame(salida)
 
 
-st.title("🚚 Análisis y optimización de fletes")
-st.caption("Carga las hojas mensuales de operación y un tarifario para consolidar viajes, costos y recomendaciones por cliente y destino.")
+def excel_bytes(tablas: dict[str, pd.DataFrame]) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for hoja, tabla in tablas.items():
+            tabla.to_excel(writer, sheet_name=hoja[:31], index=False)
+    return buffer.getvalue()
 
-with st.sidebar:
-    st.header("Archivos de entrada")
-    operations_file = st.file_uploader("Excel de operaciones", type=["xlsx", "xls"])
-    rates_file = st.file_uploader("Excel de tarifas", type=["xlsx", "xls"])
-    st.markdown(
-        "**Tarifario esperado**  \n"
-        "A: Transportista · B: Unidad · C: Costo de flete · D: Destino"
+
+st.title("🚚 LogiSense | Resumen y optimización de fletes")
+st.caption("Procesa únicamente hojas mensuales y recomienda la combinación tarifada más económica por cliente, destino y mes.")
+
+with st.expander("Capacidades operativas configuradas", expanded=False):
+    st.dataframe(
+        pd.DataFrame(
+            [{"Unidad": unidad, "Tarimas": valores["tarimas"], "KG": valores["kgs"]} for unidad, valores in CAPACIDADES.items()]
+        ),
+        use_container_width=True,
+        hide_index=True,
     )
 
-if not operations_file:
-    st.info("Carga el Excel de operaciones para comenzar. Solo se procesarán hojas llamadas ENERO a DICIEMBRE.")
+col_carga, col_tarifa = st.columns(2)
+with col_carga:
+    archivo_operacion = st.file_uploader("Archivo operativo Excel", type=["xlsx"])
+with col_tarifa:
+    archivo_tarifas = st.file_uploader(
+        "Tarifario Excel opcional", type=["xlsx"],
+        help="Columnas esperadas: TRANSPORTISTA, UNIDAD, COSTO DE FLETE y DESTINO.",
+    )
+
+if archivo_operacion is None:
+    st.info("Carga el Excel operativo para comenzar.")
     st.stop()
 
-try:
-    operations, processed_sheets, sheet_warnings = load_monthly_operations(operations_file.getvalue())
-except Exception as exc:
-    st.error(f"No fue posible leer el archivo de operaciones: {exc}")
+with st.spinner("Leyendo hojas mensuales y preparando indicadores..."):
+    datos, hojas, errores = cargar_operacion(archivo_operacion.getvalue())
+
+if datos.empty:
+    st.error("No se encontraron hojas mensuales válidas con las columnas requeridas.")
+    if hojas:
+        st.write("Hojas mensuales detectadas:", ", ".join(hojas))
+    if errores:
+        st.write("Detalle:", " | ".join(errores))
     st.stop()
 
-summary = summarize_operations(operations)
-summary["Destino_match"] = summary["Destino"].map(normalize_text)
+if errores:
+    st.warning("Se omitieron hojas con estructura incompleta: " + " | ".join(errores))
 
-with st.sidebar:
-    st.success(f"Hojas procesadas: {', '.join(processed_sheets)}")
-    if sheet_warnings:
-        st.warning("Hojas omitidas: " + " | ".join(sheet_warnings))
-    clients = sorted(summary["CLIENTE"].dropna().unique())
-    selected_clients = st.multiselect("Cliente", clients, default=clients)
-    month_choices = [month for month in MONTH_ORDER if month in summary["MES FACTURA"].unique()]
-    extra_months = sorted(set(summary["MES FACTURA"].unique()) - set(month_choices))
-    selected_months = st.multiselect("Período", month_choices + extra_months, default=month_choices + extra_months)
+tarifas = pd.DataFrame()
+if archivo_tarifas is not None:
+    with st.spinner("Validando tarifario y normalizando destinos..."):
+        tarifas, error_tarifa = cargar_tarifas(archivo_tarifas.getvalue())
+    if error_tarifa:
+        st.warning(error_tarifa)
+    elif not tarifas.empty:
+        st.success(f"Tarifario listo: {len(tarifas):,} tarifas válidas. El match de destino ignora acentos, mayúsculas y espacios extra.")
 
-filtered = summary[
-    summary["CLIENTE"].isin(selected_clients)
-    & summary["MES FACTURA"].isin(selected_months)
-].copy()
+st.sidebar.header("Filtros")
+clientes = sorted(datos["CLIENTE"].dropna().unique().tolist())
+meses_disponibles = [mes for mes in MESES if mes in datos["MES"].unique()]
+clientes_sel = st.sidebar.multiselect("Cliente", clientes)
+meses_sel = st.sidebar.multiselect("Periodo mensual", meses_disponibles, default=meses_disponibles)
 
-metric_one, metric_two, metric_three, metric_four = st.columns(4)
-metric_one.metric("Grupos mostrados", f"{len(filtered):,}")
-metric_two.metric("Viajes únicos", f"{int(filtered['Cantidad de viajes'].sum()):,}")
-metric_three.metric("Tarimas", f"{filtered['Suma tarimas'].sum():,.0f}")
-metric_four.metric("Flete facturado", f"${filtered['Suma flete'].sum():,.2f}")
+filtrado = datos.copy()
+if clientes_sel:
+    filtrado = filtrado[filtrado["CLIENTE"].isin(clientes_sel)]
+if meses_sel:
+    filtrado = filtrado[filtrado["MES"].isin(meses_sel)]
 
-st.subheader("Resultados agrupados")
-display_columns = [
-    "CLIENTE", "Destino", "MES FACTURA", "Cantidad de viajes", "Suma facturado",
-    "Suma tarimas", "Suma flete", "Tarimas promedio", "Promedio flete",
-    "Flete/Tarimas", "KG movidos",
-] + VEHICLE_ORDER
-st.dataframe(
-    currency_columns(filtered[display_columns]).sort_values(["CLIENTE", "Destino", "MES FACTURA"]),
-    use_container_width=True,
-    hide_index=True,
-)
-
-csv_bytes = filtered[display_columns].to_csv(index=False).encode("utf-8-sig")
-st.download_button("Descargar resultados CSV", csv_bytes, "resultados_fletes.csv", "text/csv")
-
-st.subheader("Sugerencia de unidad")
-if not rates_file:
-    st.info("Carga el tarifario para generar recomendaciones. El match de destino ignora acentos, mayúsculas y espacios repetidos.")
+if filtrado.empty:
+    st.warning("Los filtros no devuelven registros.")
     st.stop()
 
-try:
-    rates = load_rates(rates_file.getvalue())
-except Exception as exc:
-    st.error(f"No fue posible leer el tarifario: {exc}")
-    st.stop()
+tabla_resumen = resumir(filtrado)
+viajes = tabla_resumen["Cantidad de viajes"].sum()
+flete = tabla_resumen["Suma flete"].sum()
+tarimas = tabla_resumen["Suma tarimas"].sum()
+kgs = tabla_resumen["KG movidos"].sum()
 
-if rates.empty:
-    st.warning("No se detectaron tarifas válidas. Verifica las columnas A-D, unidades y costos.")
-    st.stop()
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Viajes únicos", f"{viajes:,.0f}")
+k2.metric("Flete facturado", f"${flete:,.2f}")
+k3.metric("Tarimas movilizadas", f"{tarimas:,.0f}")
+k4.metric("KG movidos", f"{kgs:,.0f}")
 
-if filtered.empty:
-    st.warning("No hay grupos con los filtros seleccionados.")
-    st.stop()
+tab_resumen, tab_sugerencias, tab_visual = st.tabs(["📋 Resumen agrupado", "💡 Sugerencias", "📊 Visual"])
 
-selection_options = filtered.apply(
-    lambda row: f"{row['CLIENTE']} | {row['Destino']} | {row['MES FACTURA']}", axis=1
-).tolist()
-selected_label = st.selectbox("Selecciona cliente, destino y mes", selection_options)
-selected_position = selection_options.index(selected_label)
-selected_group = filtered.iloc[selected_position]
-suggestion, options = recommendation_for_group(selected_group, rates)
+with tab_resumen:
+    st.subheader("Cliente y destino por mes")
+    mostrar_resumen = tabla_resumen.drop(columns=["DESTINO_MATCH"])
+    st.dataframe(
+        mostrar_resumen.style.format({
+            "Suma facturado": "${:,.2f}", "Suma flete": "${:,.2f}",
+            "Tarimas promedio": "{:,.2f}", "Promedio flete": "${:,.2f}",
+            "Flete/Tarimas": "${:,.2f}", "KG movidos": "{:,.0f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-st.info(suggestion)
-if isinstance(options, pd.DataFrame) and not options.empty:
-    options_display = options.copy()
-    options_display["Costo estimado"] = options_display["Costo estimado"].map(lambda val: f"${val:,.2f}")
-    st.dataframe(options_display, use_container_width=True, hide_index=True)
+with tab_sugerencias:
+    st.subheader("Recomendación de unidades basada en capacidad y tarifa")
+    if tarifas.empty:
+        st.info("Carga un tarifario para calcular recomendaciones y alternativas por destino.")
+    else:
+        tabla_sugerencias = recomendaciones(tabla_resumen, tarifas)
+        columnas_sugerencia = [
+            "CLIENTE", "Destino", "MES", "Suma tarimas", "KG movidos",
+            "Recomendación principal", "Alternativa si el CEDIS no acepta la primera",
+        ]
+        st.dataframe(
+            tabla_sugerencias[columnas_sugerencia].style.format({"Suma tarimas": "{:,.0f}", "KG movidos": "{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "La recomendación elige la alternativa de menor costo total que cubra simultáneamente tarimas y KG. "
+            "Solo considera unidades que tengan tarifa cargada para el destino normalizado."
+        )
 
-st.caption(
-    "Criterio: se calcula la cantidad mínima de unidades que cubre simultáneamente tarimas y kg. "
-    "La opción principal es la de menor costo tarifado disponible para el destino; la segunda es la siguiente alternativa más económica."
+with tab_visual:
+    grafica = (
+        tabla_resumen.groupby("MES", as_index=False)["Suma flete"].sum()
+        .assign(MES=lambda tabla: pd.Categorical(tabla["MES"], categories=MESES, ordered=True))
+        .sort_values("MES")
+    )
+    fig = px.bar(grafica, x="MES", y="Suma flete", text_auto=".2s", color_discrete_sequence=["#1f77b4"])
+    fig.update_layout(title="Flete facturado por mes", xaxis_title="", yaxis_title="Flete", height=410)
+    st.plotly_chart(fig, use_container_width=True)
+
+tablas_exportar = {"Resumen": mostrar_resumen}
+if not tarifas.empty:
+    tablas_exportar["Sugerencias"] = recomendaciones(tabla_resumen, tarifas).drop(columns=["DESTINO_MATCH"])
+st.download_button(
+    "⬇️ Descargar resultados en Excel",
+    data=excel_bytes(tablas_exportar),
+    file_name="logisense_resultados.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
