@@ -306,12 +306,16 @@ clientes = sorted(datos["CLIENTE"].dropna().unique().tolist())
 meses_disponibles = [mes for mes in MESES if mes in datos["MES"].unique()]
 clientes_sel = st.sidebar.multiselect("Cliente", clientes)
 meses_sel = st.sidebar.multiselect("Periodo mensual", meses_disponibles, default=meses_disponibles)
+destinos = sorted(datos["Destino"].dropna().unique().tolist())
+destinos_sel = st.sidebar.multiselect("Destino", destinos)
 
 filtrado = datos.copy()
 if clientes_sel:
     filtrado = filtrado[filtrado["CLIENTE"].isin(clientes_sel)]
 if meses_sel:
     filtrado = filtrado[filtrado["MES"].isin(meses_sel)]
+if destinos_sel:
+    filtrado = filtrado[filtrado["Destino"].isin(destinos_sel)]
 
 if filtrado.empty:
     st.warning("Los filtros no devuelven registros.")
